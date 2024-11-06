@@ -401,7 +401,8 @@ async def chat_completion_tools_handler(
     if app.state.config.TOOLS_FUNCTION_CALLING_PROMPT_TEMPLATE != "":
         template = app.state.config.TOOLS_FUNCTION_CALLING_PROMPT_TEMPLATE
     else:
-        template = """Available Tools: {{TOOLS}}\nReturn an empty string if no tools match the query. If a function tool matches, construct and return a JSON object in the format {\"name\": \"functionName\", \"parameters\": {\"requiredFunctionParamKey\": \"requiredFunctionParamValue\"}} using the appropriate tool and its parameters. Only return the object and limit the response to the JSON object without additional text."""
+        template = """Available Tools: {{TOOLS}}
+Return an empty array [] if no tools match the query. If function tools match, construct and return a JSON array of objects in the format [{\"name\": \"functionName\", \"parameters\": {\"requiredFunctionParamKey\": \"requiredFunctionParamValue\"}}, ...] using the appropriate tools and their parameters. Only return the array and limit the response to the JSON array without additional text."""
 
     tools_function_calling_prompt = tools_function_calling_generation_template(
         template, tools_specs
@@ -426,51 +427,75 @@ async def chat_completion_tools_handler(
             return body, {}
 
         try:
-            content = content[content.find("{") : content.rfind("}") + 1]
+            # Parse the content as either a single object or array of objects
+            content = content[content.find("[") : content.rfind("]") + 1]
             if not content:
-                raise Exception("No JSON object found in the response")
+                content = content[content.find("{") : content.rfind("}") + 1]
+                if not content:
+                    raise Exception("No JSON object found in the response")
+                tool_calls = [json.loads(content)]
+            else:
+                tool_calls = json.loads(content)
+                if not isinstance(tool_calls, list):
+                    tool_calls = [tool_calls]
 
-            result = json.loads(content)
+            # Process each tool call in parallel
+            async def process_tool_call(tool_call):
+                tool_function_name = tool_call.get("name", None)
+                if tool_function_name not in tools:
+                    return None, None, False
 
-            tool_function_name = result.get("name", None)
-            if tool_function_name not in tools:
-                return body, {}
+                tool_function_params = tool_call.get("parameters", {})
 
-            tool_function_params = result.get("parameters", {})
+                try:
+                    required_params = (
+                        tools[tool_function_name]
+                        .get("spec", {})
+                        .get("parameters", {})
+                        .get("required", [])
+                    )
+                    tool_function = tools[tool_function_name]["callable"]
+                    tool_function_params = {
+                        k: v
+                        for k, v in tool_function_params.items()
+                        if k in required_params
+                    }
+                    tool_output = await tool_function(**tool_function_params)
 
-            try:
-                required_params = (
-                    tools[tool_function_name]
-                    .get("spec", {})
-                    .get("parameters", {})
-                    .get("required", [])
-                )
-                tool_function = tools[tool_function_name]["callable"]
-                tool_function_params = {
-                    k: v
-                    for k, v in tool_function_params.items()
-                    if k in required_params
-                }
-                tool_output = await tool_function(**tool_function_params)
+                except Exception as e:
+                    tool_output = str(e)
 
-            except Exception as e:
-                tool_output = str(e)
-
-            if tools[tool_function_name]["citation"]:
-                citations.append(
-                    {
+                citation = None
+                if tools[tool_function_name]["citation"]:
+                    citation = {
                         "source": {
                             "name": f"TOOL:{tools[tool_function_name]['toolkit_id']}/{tool_function_name}"
                         },
                         "document": [tool_output],
                         "metadata": [{"source": tool_function_name}],
                     }
-                )
-            if tools[tool_function_name]["file_handler"]:
-                skip_files = True
 
-            if isinstance(tool_output, str):
-                contexts.append(tool_output)
+                return (
+                    tool_output if isinstance(tool_output, str) else None,
+                    citation,
+                    tools[tool_function_name]["file_handler"],
+                )
+
+            # Execute all tool calls concurrently
+            results = await asyncio.gather(
+                *[process_tool_call(tool_call) for tool_call in tool_calls]
+            )
+
+            # Aggregate results
+            skip_files = False
+            for context, citation, is_file_handler in results:
+                if context:
+                    contexts.append(context)
+                if citation:
+                    citations.append(citation)
+                if is_file_handler:
+                    skip_files = True
+
         except Exception as e:
             log.exception(f"Error: {e}")
             content = None
